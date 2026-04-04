@@ -1,8 +1,9 @@
 from torch.utils.data import Dataset, DataLoader, Subset
 import torch
 from torch.amp import autocast, GradScaler
-from model import GPT
-from pydantic import BaseModel
+import traceback
+from model import Transformer, ModelArgs
+from dataclasses import dataclass
 
 from tqdm import tqdm
 import time
@@ -19,7 +20,7 @@ class MachadoDeAssisDataset(Dataset):
     def __init__(self, ids, block_size):
         super().__init__()
 
-        self.ids = ids
+        self.ids = torch.tensor(ids, dtype=torch.long)
         self.block_size = block_size
 
     def __len__(self):
@@ -28,30 +29,25 @@ class MachadoDeAssisDataset(Dataset):
     def __getitem__(self, index):
         chunk = self.ids[index : index + self.block_size + 1]
 
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
+        x = chunk[:-1]
+        y = chunk[1:]
 
         return x, y
 
 
-class TrainConfig(BaseModel):
+@dataclass
+class TrainConfig(ModelArgs):
     data_path: str = "data/machado_de_assis.txt"
     train_size: float = 0.9
 
-    max_vocab_size: int = 8000
-
-    block_size: int = 256
-    embedding_dim: int = 384
-    n_heads: int = 6
-    n_layers: int = 6
-    dropout: float = 0.2
+    max_vocab_size: int = 512
 
     batch_size: int = 64
     max_steps: int = 50_000
-    eval_interval: int = 500
+    eval_interval: int = 1000
     weight_decay: float = 0.1
     learning_rate: float = 3e-4
-    patience: int = 5
+    patience: int = 100
 
     seed: int = 42
     compile_model: bool = True
@@ -62,20 +58,30 @@ def cycle(dataloader):
         for batch in dataloader:
             yield batch
 
-def configure_optimizer(model, lr, weight_decay):
-    decay = [p for n, p in model.named_parameters()
-             if p.requires_grad and p.dim() >= 2]
-    no_decay = [p for n, p in model.named_parameters()
-                if p.requires_grad and p.dim() < 2]
 
-    return torch.optim.AdamW([
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ], lr=lr, betas=(0.9, 0.95), eps=1e-8)
+def configure_optimizer(
+    model: Transformer, lr: float, weight_decay: float
+) -> torch.optim.Optimizer:
+    decay = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
+    no_decay = [
+        p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2
+    ]
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
 
 
 @torch.no_grad()
-def estimate_loss(model, dataloader, device, eval_iters=50):
+def estimate_loss(
+    model: Transformer, dataloader: DataLoader, device: str, eval_iters: int = 50
+) -> float:
     model.eval()
     losses = []
 
@@ -96,19 +102,19 @@ def estimate_loss(model, dataloader, device, eval_iters=50):
 
 
 def train(
-    model,
-    optimizer,
-    scheduler,
-    train_loader,
-    val_loader,
-    max_step,
-    eval_interval,
-    config,
-    tokenizer,
-    device,
+    model: Transformer,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    max_step: int,
+    eval_interval: int,
+    config: TrainConfig,
+    tokenizer: Tokenizer,
+    device: str,
 ):
     try:
-        scaler = GradScaler()
+        scaler = GradScaler(device=device)
 
         best_val_loss = float("inf")
         os.makedirs("models/checkpoints", exist_ok=True)
@@ -119,7 +125,7 @@ def train(
         total_loss = 0
         no_improve = 0
 
-        progress_bar = tqdm(range(max_step), desc="Trainando", leave=False)
+        progress_bar = tqdm(range(max_step), desc="Treinando", leave=False)
 
         train_iter = cycle(train_loader)
 
@@ -129,7 +135,8 @@ def train(
             X_batch, y_batch = next(train_iter)
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
-            with autocast(device_type=device, dtype=torch.float16):
+            dtype = torch.float16 if device == "cuda" else torch.bfloat16
+            with autocast(device_type=device, dtype=dtype):
                 logits, loss = model(X_batch, y_batch)
 
             scaler.scale(loss).backward()
@@ -147,7 +154,8 @@ def train(
             scheduler.step()
 
             if step % eval_interval == 0:
-                train_loss = total_loss / eval_interval
+                steps_since_eval = eval_interval if step > 0 else 1
+                train_loss = total_loss / steps_since_eval
 
                 val_loss = estimate_loss(model, val_loader, device)
                 dt = time.time() - t0
@@ -163,16 +171,20 @@ def train(
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    no_improve = 0
 
-                    torch.save({
-                        "model_state_dict": model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "scaler_state_dict": scaler.state_dict(),
-                        "step": step,
-                        "best_val_loss": best_val_loss,
-                        "config": config}, 
-                        "models/checkpoints/best_model.pt")
+                    torch.save(
+                        {
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scheduler_state_dict": scheduler.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "step": step,
+                            "best_val_loss": best_val_loss,
+                            "config": config,
+                        },
+                        "models/checkpoints/best_model.pt",
+                    )
                 else:
                     no_improve += 1
                     if no_improve >= config.patience:
@@ -195,8 +207,9 @@ def train(
 
         return True
 
-    except Exception as e:
-        print(str(e))
+    except Exception:
+        traceback.print_exc()
+        raise
 
 
 def main():
@@ -205,7 +218,7 @@ def main():
     config = TrainConfig()
 
     torch.manual_seed(config.seed)
-    torch.backends.cuda.matmul.allow_tf32 = True   
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     tokenizer = Tokenizer(BPE())
@@ -231,7 +244,13 @@ def main():
         text = f.read()
 
     ids = tokenizer.encode(text).ids
-    
+
+    print(f"Quantidade de tokens: {len(ids)}")
+
+    config.max_steps = len(ids) // config.batch_size
+
+    print(f"Quantidade de steps: {config.max_steps}")
+
     dataset = MachadoDeAssisDataset(ids, config.block_size)
 
     split = int(len(dataset) * config.train_size)
@@ -244,21 +263,16 @@ def main():
         shuffle=True,
         num_workers=4,
         pin_memory=True,
+        persistent_workers=True,
     )
+
     val_loader = DataLoader(
         val_data, batch_size=config.batch_size, num_workers=4, pin_memory=True
     )
 
-    vocab_size = tokenizer.get_vocab_size()
+    config.vocab_size = tokenizer.get_vocab_size()
 
-    model = GPT(
-        vocab_size=vocab_size,
-        n_layers=config.n_layers,
-        embedding_dim=config.embedding_dim,
-        n_heads=config.n_heads,
-        block_size=config.block_size,
-        dropout=config.dropout,
-    ).to(device)
+    model = Transformer(config).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parâmetros: {n_params / 1e6:.2f}M")
